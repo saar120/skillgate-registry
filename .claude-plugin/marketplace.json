@@ -1,0 +1,17 @@
+{
+  "name": "saar120-skillgate",
+  "owner": {
+    "name": "saar120"
+  },
+  "metadata": {
+    "description": "SkillGate vetted plugins",
+    "version": "1.0.0"
+  },
+  "plugins": [
+    {
+      "name": "superpowers",
+      "source": "./plugins/superpowers",
+      "description": "Vetted: superpowers"
+    }
+  ]
+}
