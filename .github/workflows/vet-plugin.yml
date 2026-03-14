@@ -4,31 +4,32 @@ on:
   workflow_dispatch:
     inputs:
       upstream_url:
-        description: "GitHub URL of the plugin (e.g. github.com/obra/superpowers)"
+        description: "GitHub URL (e.g. github.com/obra/superpowers)"
         required: true
         type: string
 
 permissions:
   contents: write
-  issues: write
 
 jobs:
-  vet:
+
+  # ── Stage 1: Validate ─────────────────────────────────────────
+  pre-check:
+    name: Pre-check
     runs-on: ubuntu-latest
-    env:
-      UPSTREAM_URL: ${{ inputs.upstream_url }}
-      REPO_OWNER: ${{ github.repository_owner }}
-      SERVER_URL: ${{ github.server_url }}
-      REPO_FULL: ${{ github.repository }}
-      RUN_ID: ${{ github.run_id }}
+    outputs:
+      owner: ${{ steps.parse.outputs.owner }}
+      repo: ${{ steps.parse.outputs.repo }}
+      name: ${{ steps.parse.outputs.name }}
+      exists: ${{ steps.registry.outputs.exists }}
     steps:
       - name: Checkout registry
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      - name: Parse plugin URL
+      - name: Parse URL
         id: parse
+        env:
+          UPSTREAM_URL: ${{ inputs.upstream_url }}
         run: |
           REPO_PATH=$(echo "$UPSTREAM_URL" | sed -E 's|^https?://||; s|^github\.com/||; s|\.git$||; s|/$||')
           OWNER=$(echo "$REPO_PATH" | cut -d'/' -f1)
@@ -40,54 +41,120 @@ jobs:
           echo "owner=$OWNER" >> "$GITHUB_OUTPUT"
           echo "repo=$REPO" >> "$GITHUB_OUTPUT"
           echo "name=$REPO" >> "$GITHUB_OUTPUT"
-          echo "Vetting $OWNER/$REPO"
 
-      - name: Clone upstream
+      - name: Verify upstream exists
         env:
-          PLUGIN_OWNER: ${{ steps.parse.outputs.owner }}
-          PLUGIN_REPO: ${{ steps.parse.outputs.repo }}
-        run: |
-          git clone --depth 1 \
-            "https://github.com/${PLUGIN_OWNER}/${PLUGIN_REPO}.git" \
-            /tmp/plugin
-          rm -rf /tmp/plugin/.git
-
-      - name: Install gitleaks
-        run: |
-          curl -sSfL \
-            https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_linux_x64.tar.gz \
-            | tar xz -C /usr/local/bin gitleaks
-
-      - name: Scan for secrets
-        id: scan
-        run: |
-          set +e
-          gitleaks detect --source /tmp/plugin --no-git \
-            --report-format json --report-path /tmp/gitleaks-report.json 2>&1
-          EXIT=$?
-          set -e
-          if [ $EXIT -eq 0 ]; then
-            echo "result=PASS" >> "$GITHUB_OUTPUT"
-            echo "No secrets found"
-          else
-            echo "result=FAIL" >> "$GITHUB_OUTPUT"
-            echo "Secrets detected"
-          fi
-
-      - name: Publish to registry
-        if: steps.scan.outputs.result == 'PASS'
-        env:
-          NAME: ${{ steps.parse.outputs.name }}
-          PLUGIN_OWNER: ${{ steps.parse.outputs.owner }}
-          PLUGIN_REPO: ${{ steps.parse.outputs.repo }}
+          OWNER: ${{ steps.parse.outputs.owner }}
+          REPO: ${{ steps.parse.outputs.repo }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Copy plugin into plugins/{name}/
+          if ! gh api "repos/$OWNER/$REPO" --silent 2>/dev/null; then
+            echo "::error::Cannot access $OWNER/$REPO"
+            exit 1
+          fi
+          echo "Upstream verified"
+
+      - name: Check registry
+        id: registry
+        env:
+          NAME: ${{ steps.parse.outputs.name }}
+        run: |
+          if [ -d "plugins/$NAME" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Plugin exists — will update"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "New plugin"
+          fi
+
+  # ── Stage 2: Security checks (parallel) ───────────────────────
+  # To add a check:
+  #   1. Create .github/workflows/check-{name}.yml (see check-gitleaks.yml)
+  #   2. Add a job below with: needs: pre-check, uses: ./.github/workflows/check-{name}.yml
+  #   3. Add it to the decide job's needs + aggregate step
+
+  gitleaks:
+    name: Gitleaks
+    needs: pre-check
+    uses: ./.github/workflows/check-gitleaks.yml
+    with:
+      owner: ${{ needs.pre-check.outputs.owner }}
+      repo: ${{ needs.pre-check.outputs.repo }}
+
+  # ── Stage 3: Aggregate results ────────────────────────────────
+  decide:
+    name: Decide
+    needs: [pre-check, gitleaks]
+    runs-on: ubuntu-latest
+    outputs:
+      result: ${{ steps.aggregate.outputs.result }}
+    steps:
+      - name: Aggregate check results
+        id: aggregate
+        env:
+          GITLEAKS: ${{ needs.gitleaks.outputs.result }}
+        run: |
+          CHECKS="$GITLEAKS"
+          # Future: CHECKS="$GITLEAKS $TRIVY $PATTERNS"
+
+          HAS_FAIL=false
+          HAS_REVIEW=false
+          for r in $CHECKS; do
+            case "$r" in
+              fail)   HAS_FAIL=true ;;
+              review) HAS_REVIEW=true ;;
+            esac
+          done
+
+          if $HAS_FAIL; then
+            echo "result=FAIL" >> "$GITHUB_OUTPUT"
+            echo "::error::Security checks failed"
+          elif $HAS_REVIEW; then
+            echo "result=REVIEW" >> "$GITHUB_OUTPUT"
+            echo "::warning::Needs human review"
+          else
+            echo "result=PASS" >> "$GITHUB_OUTPUT"
+            echo "All checks passed"
+          fi
+
+  # ── Stage 4: Publish (auto or after approval) ─────────────────
+  # When result=REVIEW, this job pauses for approval via the
+  # "review" environment. Set up required reviewers:
+  #   Settings → Environments → review → Required reviewers
+
+  publish:
+    name: Publish
+    needs: [pre-check, decide]
+    if: needs.decide.outputs.result != 'FAIL'
+    environment: ${{ needs.decide.outputs.result == 'REVIEW' && 'review' || '' }}
+    concurrency:
+      group: publish
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    env:
+      NAME: ${{ needs.pre-check.outputs.name }}
+      PLUGIN_OWNER: ${{ needs.pre-check.outputs.owner }}
+      PLUGIN_REPO: ${{ needs.pre-check.outputs.repo }}
+      REPO_OWNER: ${{ github.repository_owner }}
+    steps:
+      - name: Checkout registry
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Clone upstream
+        run: |
+          git clone --depth 1 "https://github.com/$PLUGIN_OWNER/$PLUGIN_REPO.git" /tmp/plugin
+          rm -rf /tmp/plugin/.git
+
+      - name: Copy to registry
+        run: |
           rm -rf "plugins/$NAME"
           mkdir -p plugins
           cp -a /tmp/plugin "plugins/$NAME"
 
-          # Regenerate marketplace.json from plugins/ directory
+      - name: Generate marketplace.json
+        run: |
           mkdir -p .claude-plugin
           PLUGINS='[]'
           for dir in plugins/*/; do
@@ -106,15 +173,21 @@ jobs:
               plugins: $plugins
             }' > .claude-plugin/marketplace.json
 
-          # Commit & push
+      - name: Commit & push
+        run: |
           git config user.name "SkillGate Bot"
           git config user.email "skillgate@users.noreply.github.com"
           git add plugins/ .claude-plugin/
-          git diff --cached --quiet && { echo "No changes to publish"; exit 0; }
+          git diff --cached --quiet && { echo "No changes"; exit 0; }
           git commit -m "publish: $NAME from $PLUGIN_OWNER/$PLUGIN_REPO"
+          git pull --rebase origin main
           git push origin main
 
-          # Tag & release
+      - name: Tag & release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git fetch --tags
           LAST=$(git tag -l "$NAME/v*" | sed "s|$NAME/v||" | sort -n | tail -1)
           VERSION=$(( ${LAST:-0} + 1 ))
           TAG="$NAME/v$VERSION"
@@ -124,40 +197,9 @@ jobs:
             --title "$NAME v$VERSION" \
             --notes "Vetted copy of [$PLUGIN_OWNER/$PLUGIN_REPO](https://github.com/$PLUGIN_OWNER/$PLUGIN_REPO)"
 
-      - name: Report failure
-        if: steps.scan.outputs.result == 'FAIL'
-        env:
-          NAME: ${{ steps.parse.outputs.name }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          FINDINGS=$(jq -r \
-            '.[] | "- **\(.File)**:\(.StartLine) — \(.Description)"' \
-            /tmp/gitleaks-report.json 2>/dev/null \
-            || echo "See workflow run for details")
-          cat > /tmp/issue-body.md <<EOF
-          ## Gitleaks scan failed
-
-          **Plugin:** \`$NAME\`
-          **Source:** $UPSTREAM_URL
-          **Run:** $SERVER_URL/$REPO_FULL/actions/runs/$RUN_ID
-
-          ### Findings
-          $FINDINGS
-          EOF
-          gh issue create \
-            --title "Failed: $NAME" \
-            --body-file /tmp/issue-body.md
-
       - name: Summary
-        if: always()
         env:
-          RESULT: ${{ steps.scan.outputs.result }}
-          NAME: ${{ steps.parse.outputs.name }}
+          UPSTREAM_URL: ${{ inputs.upstream_url }}
         run: |
-          echo "## $NAME: $RESULT" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Published: $NAME v$VERSION" >> "$GITHUB_STEP_SUMMARY"
           echo "**Source:** $UPSTREAM_URL" >> "$GITHUB_STEP_SUMMARY"
-          if [ "$RESULT" = "PASS" ]; then
-            echo "Published to registry." >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "Issue created with details." >> "$GITHUB_STEP_SUMMARY"
-          fi
