@@ -9,6 +9,11 @@
   },
   "plugins": [
     {
+      "name": "everything-claude-code",
+      "source": "./plugins/everything-claude-code",
+      "description": "Vetted: everything-claude-code"
+    },
+    {
       "name": "superpowers",
       "source": "./plugins/superpowers",
       "description": "Vetted: superpowers"
