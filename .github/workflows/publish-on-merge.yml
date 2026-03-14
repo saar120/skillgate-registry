@@ -1,0 +1,52 @@
+name: Publish on Merge
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+permissions:
+  contents: write
+
+env:
+  SKILLGATE_GITHUB_TOKEN: ${{ secrets.SKILLGATE_GITHUB_TOKEN }}
+
+jobs:
+  publish:
+    if: github.event.pull_request.merged == true && startsWith(github.event.pull_request.head.ref, 'skillgate/review/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout registry
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install SkillGate
+        run: |
+          git clone https://github.com/saar120/skillGate.git /tmp/skillgate
+          cd /tmp/skillgate
+          npm ci
+          npm run build
+          npm link
+
+      - name: Extract plugin name and publish
+        run: |
+          # Extract plugin name from branch: skillgate/review/{name}
+          BRANCH="${{ github.event.pull_request.head.ref }}"
+          PLUGIN_NAME="${BRANCH#skillgate/review/}"
+          echo "Publishing $PLUGIN_NAME..."
+
+          git config user.name "SkillGate Bot"
+          git config user.email "skillgate@users.noreply.github.com"
+
+          skillgate approve "$PLUGIN_NAME" latest
+
+      - name: Delete review branch
+        run: |
+          BRANCH="${{ github.event.pull_request.head.ref }}"
+          git push origin --delete "$BRANCH" || true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
