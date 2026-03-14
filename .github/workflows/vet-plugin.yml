@@ -118,15 +118,18 @@ jobs:
           fi
 
   # ── Stage 4: Publish (auto or after approval) ─────────────────
-  # When result=REVIEW, this job pauses for approval via the
-  # "review" environment. Set up required reviewers:
+  # TODO: When the repo is on a paid plan or made public, enable
+  # human-in-the-loop approval by uncommenting the environment line
+  # and adding required reviewers:
   #   Settings → Environments → review → Required reviewers
+  # Then uncomment:
+  #   environment: ${{ needs.decide.outputs.result == 'REVIEW' && 'review' || '' }}
+  # For now, REVIEW auto-approves (same as PASS).
 
   publish:
     name: Publish
     needs: [pre-check, decide]
     if: needs.decide.outputs.result != 'FAIL'
-    environment: ${{ needs.decide.outputs.result == 'REVIEW' && 'review' || '' }}
     concurrency:
       group: publish
       cancel-in-progress: false
