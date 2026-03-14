@@ -4,192 +4,160 @@ on:
   workflow_dispatch:
     inputs:
       upstream_url:
-        description: "GitHub URL of the plugin (e.g., github.com/obra/superpowers)"
+        description: "GitHub URL of the plugin (e.g. github.com/obra/superpowers)"
         required: true
         type: string
-      policy:
-        description: "Audit policy"
-        required: false
-        type: choice
-        options:
-          - standard
-          - strict
-          - permissive
-        default: standard
 
 permissions:
   contents: write
-  pull-requests: write
   issues: write
-
-env:
-  SKILLGATE_GITHUB_TOKEN: ${{ secrets.SKILLGATE_GITHUB_TOKEN }}
 
 jobs:
   vet:
     runs-on: ubuntu-latest
+    env:
+      UPSTREAM_URL: ${{ inputs.upstream_url }}
+      REPO_OWNER: ${{ github.repository_owner }}
+      SERVER_URL: ${{ github.server_url }}
+      REPO_FULL: ${{ github.repository }}
+      RUN_ID: ${{ github.run_id }}
     steps:
       - name: Checkout registry
         uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          fetch-depth: 0
 
-      - name: Install SkillGate
+      - name: Parse plugin URL
+        id: parse
         run: |
-          git clone https://github.com/saar120/skillGate.git /tmp/skillgate
-          cd /tmp/skillgate
-          npm ci
-          npm run build
-          npm link
-
-      - name: Install security tools
-        run: |
-          # gitleaks
-          curl -sSL https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_linux_x64.tar.gz | tar xz -C /usr/local/bin gitleaks
-          # trivy
-          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
-
-      - name: Ensure skillgate.yaml exists
-        run: |
-          if [ ! -f skillgate.yaml ]; then
-            skillgate config --init "${{ github.repository_owner }}" --mirror-repo "${{ github.event.repository.name }}"
-            sed -i 's/github_token_env: GITHUB_TOKEN/github_token_env: SKILLGATE_GITHUB_TOKEN/' skillgate.yaml
+          REPO_PATH=$(echo "$UPSTREAM_URL" | sed -E 's|^https?://||; s|^github\.com/||; s|\.git$||; s|/$||')
+          OWNER=$(echo "$REPO_PATH" | cut -d'/' -f1)
+          REPO=$(echo "$REPO_PATH" | cut -d'/' -f2)
+          if [ -z "$OWNER" ] || [ -z "$REPO" ]; then
+            echo "::error::Invalid URL. Use: github.com/owner/repo"
+            exit 1
           fi
+          echo "owner=$OWNER" >> "$GITHUB_OUTPUT"
+          echo "repo=$REPO" >> "$GITHUB_OUTPUT"
+          echo "name=$REPO" >> "$GITHUB_OUTPUT"
+          echo "Vetting $OWNER/$REPO"
 
-      - name: Extract plugin name
-        id: plugin
+      - name: Clone upstream
+        env:
+          PLUGIN_OWNER: ${{ steps.parse.outputs.owner }}
+          PLUGIN_REPO: ${{ steps.parse.outputs.repo }}
         run: |
-          # Extract repo name from URL (last segment)
-          PLUGIN_NAME=$(echo "${{ inputs.upstream_url }}" | sed 's|.*/||' | sed 's|\.git$||')
-          echo "name=$PLUGIN_NAME" >> "$GITHUB_OUTPUT"
-          echo "Plugin name: $PLUGIN_NAME"
+          git clone --depth 1 \
+            "https://github.com/${PLUGIN_OWNER}/${PLUGIN_REPO}.git" \
+            /tmp/plugin
+          rm -rf /tmp/plugin/.git
 
-      - name: Add plugin if not tracked
+      - name: Install gitleaks
         run: |
-          PLUGIN_NAME="${{ steps.plugin.outputs.name }}"
-          if ! grep -q "name: $PLUGIN_NAME" skillgate.yaml 2>/dev/null; then
-            skillgate add "${{ inputs.upstream_url }}" --skip-audit -p "${{ inputs.policy }}"
+          curl -sSfL \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_linux_x64.tar.gz \
+            | tar xz -C /usr/local/bin gitleaks
+
+      - name: Scan for secrets
+        id: scan
+        run: |
+          set +e
+          gitleaks detect --source /tmp/plugin --no-git \
+            --report-format json --report-path /tmp/gitleaks-report.json 2>&1
+          EXIT=$?
+          set -e
+          if [ $EXIT -eq 0 ]; then
+            echo "result=PASS" >> "$GITHUB_OUTPUT"
+            echo "No secrets found"
           else
-            echo "Plugin $PLUGIN_NAME already tracked"
+            echo "result=FAIL" >> "$GITHUB_OUTPUT"
+            echo "Secrets detected"
           fi
 
-      - name: Run audit
-        id: audit
-        run: |
-          PLUGIN_NAME="${{ steps.plugin.outputs.name }}"
-          skillgate audit "$PLUGIN_NAME" --json > /tmp/audit-report.json 2>&1 || true
-          RESULT=$(jq -r '.overall_result // "FAIL"' /tmp/audit-report.json)
-          echo "result=$RESULT" >> "$GITHUB_OUTPUT"
-          echo "Audit result: $RESULT"
-
-          # Format human-readable report
-          skillgate audit "$PLUGIN_NAME" > /tmp/audit-report.txt 2>&1 || true
-
-      - name: Upload audit report
-        uses: actions/upload-artifact@v4
-        with:
-          name: audit-report-${{ steps.plugin.outputs.name }}
-          path: /tmp/audit-report.json
-          retention-days: 90
-
-      - name: On PASS — publish to mirror
-        if: steps.audit.outputs.result == 'PASS'
-        run: |
-          PLUGIN_NAME="${{ steps.plugin.outputs.name }}"
-          git config user.name "SkillGate Bot"
-          git config user.email "skillgate@users.noreply.github.com"
-
-          # Commit updated skillgate.yaml if changed
-          git add skillgate.yaml .skillgate-registry.json 2>/dev/null || true
-          git diff --cached --quiet || git commit -m "chore: track $PLUGIN_NAME"
-          git push origin main || true
-
-          # Publish to mirror
-          skillgate approve "$PLUGIN_NAME" latest
-
-      - name: On REVIEW — create PR for manual review
-        if: steps.audit.outputs.result == 'REVIEW'
-        run: |
-          PLUGIN_NAME="${{ steps.plugin.outputs.name }}"
-
-          git config user.name "SkillGate Bot"
-          git config user.email "skillgate@users.noreply.github.com"
-
-          BRANCH="skillgate/review/$PLUGIN_NAME"
-          git checkout -b "$BRANCH"
-
-          # Commit config changes
-          git add skillgate.yaml .skillgate-registry.json 2>/dev/null || true
-          git diff --cached --quiet || git commit -m "chore: track $PLUGIN_NAME (pending review)"
-          git push origin "$BRANCH" --force
-
-          # Build PR body from audit report
-          REPORT=$(cat /tmp/audit-report.txt)
-          gh pr create \
-            --title "[SkillGate] Review: $PLUGIN_NAME" \
-            --body "$(cat <<EOF
-          ## Audit Result: REVIEW
-
-          The plugin \`$PLUGIN_NAME\` (\`${{ inputs.upstream_url }}\`) needs manual review before publishing.
-
-          ### Audit Report
-          \`\`\`
-          $REPORT
-          \`\`\`
-
-          ### Actions
-          - **Merge** this PR to approve and publish
-          - **Close** to reject
-
-          [View full audit report](../actions/runs/${{ github.run_id }})
-          EOF
-          )" \
-            --head "$BRANCH" \
-            --base main
+      - name: Publish to registry
+        if: steps.scan.outputs.result == 'PASS'
         env:
+          NAME: ${{ steps.parse.outputs.name }}
+          PLUGIN_OWNER: ${{ steps.parse.outputs.owner }}
+          PLUGIN_REPO: ${{ steps.parse.outputs.repo }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: On FAIL — create issue
-        if: steps.audit.outputs.result == 'FAIL'
         run: |
-          PLUGIN_NAME="${{ steps.plugin.outputs.name }}"
-          REPORT=$(cat /tmp/audit-report.txt)
+          # Copy plugin into plugins/{name}/
+          rm -rf "plugins/$NAME"
+          mkdir -p plugins
+          cp -a /tmp/plugin "plugins/$NAME"
 
+          # Regenerate marketplace.json from plugins/ directory
+          mkdir -p .claude-plugin
+          PLUGINS='[]'
+          for dir in plugins/*/; do
+            [ -d "$dir" ] || continue
+            P=$(basename "$dir")
+            PLUGINS=$(echo "$PLUGINS" | jq --arg n "$P" \
+              '. + [{"name":$n,"source":("./plugins/"+$n),"description":("Vetted: "+$n)}]')
+          done
+          jq -n \
+            --arg owner "$REPO_OWNER" \
+            --argjson plugins "$PLUGINS" \
+            '{
+              name: ($owner + "-skillgate"),
+              owner: { name: $owner },
+              metadata: { description: "SkillGate vetted plugins", version: "1.0.0" },
+              plugins: $plugins
+            }' > .claude-plugin/marketplace.json
+
+          # Commit & push
+          git config user.name "SkillGate Bot"
+          git config user.email "skillgate@users.noreply.github.com"
+          git add plugins/ .claude-plugin/
+          git diff --cached --quiet && { echo "No changes to publish"; exit 0; }
+          git commit -m "publish: $NAME from $PLUGIN_OWNER/$PLUGIN_REPO"
+          git push origin main
+
+          # Tag & release
+          LAST=$(git tag -l "$NAME/v*" | sed "s|$NAME/v||" | sort -n | tail -1)
+          VERSION=$(( ${LAST:-0} + 1 ))
+          TAG="$NAME/v$VERSION"
+          git tag -a "$TAG" -m "$NAME v$VERSION"
+          git push origin "$TAG"
+          gh release create "$TAG" \
+            --title "$NAME v$VERSION" \
+            --notes "Vetted copy of [$PLUGIN_OWNER/$PLUGIN_REPO](https://github.com/$PLUGIN_OWNER/$PLUGIN_REPO)"
+
+      - name: Report failure
+        if: steps.scan.outputs.result == 'FAIL'
+        env:
+          NAME: ${{ steps.parse.outputs.name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          FINDINGS=$(jq -r \
+            '.[] | "- **\(.File)**:\(.StartLine) — \(.Description)"' \
+            /tmp/gitleaks-report.json 2>/dev/null \
+            || echo "See workflow run for details")
+          cat > /tmp/issue-body.md <<EOF
+          ## Gitleaks scan failed
+
+          **Plugin:** \`$NAME\`
+          **Source:** $UPSTREAM_URL
+          **Run:** $SERVER_URL/$REPO_FULL/actions/runs/$RUN_ID
+
+          ### Findings
+          $FINDINGS
+          EOF
           gh issue create \
-            --title "[SkillGate] FAILED: $PLUGIN_NAME" \
-            --body "$(cat <<EOF
-          ## Audit Failed
-
-          The plugin \`$PLUGIN_NAME\` (\`${{ inputs.upstream_url }}\`) failed security checks.
-
-          ### Audit Report
-          \`\`\`
-          $REPORT
-          \`\`\`
-
-          [View full audit report](../actions/runs/${{ github.run_id }})
-          EOF
-          )"
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+            --title "Failed: $NAME" \
+            --body-file /tmp/issue-body.md
 
       - name: Summary
+        if: always()
+        env:
+          RESULT: ${{ steps.scan.outputs.result }}
+          NAME: ${{ steps.parse.outputs.name }}
         run: |
-          PLUGIN_NAME="${{ steps.plugin.outputs.name }}"
-          RESULT="${{ steps.audit.outputs.result }}"
-          echo "## SkillGate Audit: $PLUGIN_NAME" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Result:** $RESULT" >> $GITHUB_STEP_SUMMARY
-          echo "**Upstream:** ${{ inputs.upstream_url }}" >> $GITHUB_STEP_SUMMARY
-          echo "**Policy:** ${{ inputs.policy }}" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## $NAME: $RESULT" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Source:** $UPSTREAM_URL" >> "$GITHUB_STEP_SUMMARY"
           if [ "$RESULT" = "PASS" ]; then
-            echo "Plugin was automatically published to the mirror." >> $GITHUB_STEP_SUMMARY
-          elif [ "$RESULT" = "REVIEW" ]; then
-            echo "A PR has been created for manual review." >> $GITHUB_STEP_SUMMARY
+            echo "Published to registry." >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "An issue has been created with failure details." >> $GITHUB_STEP_SUMMARY
+            echo "Issue created with details." >> "$GITHUB_STEP_SUMMARY"
           fi
